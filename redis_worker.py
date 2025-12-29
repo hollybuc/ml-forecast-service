@@ -13,6 +13,7 @@ from typing import Dict, Any
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, median_absolute_error
+from services.feature_engineering import add_automated_temporal_features
 
 # Configure logging
 logging.basicConfig(
@@ -154,8 +155,9 @@ def process_training_job(job_data: Dict[str, Any]):
         date_column = job_data.get("dateColumn", "date")
         feature_columns = job_data.get("featureColumns", [])
         training_result_id = job_data.get("trainingResultId")
+        frequency = job_data.get("frequency", "D")
         
-        append_log(job_id, f"Loading dataset from {dataset_path}...")
+        append_log(job_id, f"Loading dataset from {dataset_path} (frequency: {frequency})...")
         publish_progress(job_id, "running", "Loading dataset...", 20)
         
         # Load dataset
@@ -196,39 +198,175 @@ def process_training_job(job_data: Dict[str, Any]):
         
         # Get group column if present
         group_column = job_data.get("groupColumn")
-        
+
+        # Get date scope parameters
+        training_start_date = job_data.get("trainingStartDate")
+        training_cutoff_date = job_data.get("trainingCutoffDate")
+        test_end_date = job_data.get("testEndDate")
+
+        # Extract selected models from job data
+        selected_models = job_data.get("models", [])
+
+        # Automatically generate temporal features if any selected model needs them
+        # (Currently ARIMA and Prophet can benefit, but we apply if ARIMA is selected)
+        selected_models_lower = [m.lower() for m in selected_models]
+        if 'arima' in selected_models_lower:
+            # Extract arima config for feature toggles
+            model_configs = job_data.get("modelConfigs", {})
+            arima_config = model_configs.get("arima", {})
+            append_log(job_id, "Applying automated temporal feature engineering (Fourier, Temporal)...")
+            df, generated_features = add_automated_temporal_features(df, date_column, arima_config)
+            if generated_features:
+                append_log(job_id, f"Generated features included in datasets: {generated_features}")
+            else:
+                append_log(job_id, "No new features were generated (they might already exist or detection failed).")
+                
+            append_log(job_id, f"Current columns after feature engineering: {list(df.columns)}")
+            publish_progress(job_id, "running", "Feature engineering complete", 35)
+
+        # Apply global data scope filtering if provided
+        if training_start_date:
+            try:
+                ts_start = pd.to_datetime(training_start_date).tz_localize(None)
+                df = df[df[date_column] >= ts_start].copy()
+                append_log(job_id, f"Filtered data start >= {ts_start}")
+            except Exception as e:
+                append_log(job_id, f"WARNING: Failed to apply trainingStartDate filter: {e}", "warning")
+
+        if test_end_date:
+            try:
+                ts_end = pd.to_datetime(test_end_date).tz_localize(None)
+                df = df[df[date_column] <= ts_end].copy()
+                append_log(job_id, f"Filtered data end <= {ts_end}")
+            except Exception as e:
+                append_log(job_id, f"WARNING: Failed to apply testEndDate filter: {e}", "warning")
+
         # Split data - handle grouped data properly
+        train_dfs = []
+        val_dfs = []
+        test_dfs = []
+        group_splits_catalog = {}
+
         if group_column and group_column in df.columns:
             # For grouped data, split within each group
             append_log(job_id, f"Splitting data by group: {group_column}")
-            train_dfs = []
-            val_dfs = []
-            test_dfs = []
+            publish_progress(job_id, "running", f"Splitting data by {group_column}...", 38)
             
             for group_value in df[group_column].unique():
                 group_df = df[df[group_column] == group_value].copy()
                 group_df = group_df.sort_values(date_column).reset_index(drop=True)
                 
-                train_size = int(len(group_df) * train_ratio)
-                val_size = int(len(group_df) * val_ratio)
+                g_train = pd.DataFrame()
+                g_val = pd.DataFrame()
+                g_test = pd.DataFrame()
+
+                if training_cutoff_date:
+                    try:
+                        cutoff = pd.to_datetime(training_cutoff_date).tz_localize(None)
+                        g_train = group_df[group_df[date_column] <= cutoff]
+                        g_rem = group_df[group_df[date_column] > cutoff]
+                        
+                        total_eval_ratio = val_ratio + test_ratio
+                        v_prop = val_ratio / total_eval_ratio if total_eval_ratio > 0 else 0.5
+                        v_size = int(len(g_rem) * v_prop)
+                        
+                        g_val = g_rem[:v_size]
+                        g_test = g_rem[v_size:]
+                    except Exception as e:
+                        append_log(job_id, f"WARNING: Date-based split failed for group {group_value}, falling back to ratio: {e}", "warning")
+                        training_cutoff_date = None # Fallback for this group in logic below
+
+                # Ratio-based split (either as primary or fallback)
+                if not training_cutoff_date or g_train.empty:
+                    train_size = int(len(group_df) * train_ratio)
+                    val_size = int(len(group_df) * val_ratio)
+                    g_train = group_df[:train_size]
+                    g_val = group_df[train_size:train_size + val_size]
+                    g_test = group_df[train_size + val_size:]
+
+                train_dfs.append(g_train)
+                val_dfs.append(g_val)
+                test_dfs.append(g_test)
                 
-                train_dfs.append(group_df[:train_size])
-                val_dfs.append(group_df[train_size:train_size + val_size])
-                test_dfs.append(group_df[train_size + val_size:])
+                # Save group-specific splits
+                try:
+                    splits_dir = os.path.join(os.getenv("DATASETS_PATH", "/shared/datasets"), "splits")
+                    os.makedirs(splits_dir, exist_ok=True)
+                    g_id = f"{job_id}_{str(group_value)}"
+                    
+                    g_train_file = f"{g_id}_train.csv"
+                    g_val_file = f"{g_id}_val.csv"
+                    g_test_file = f"{g_id}_test.csv"
+                    
+                    g_train.to_csv(os.path.join(splits_dir, g_train_file), index=False)
+                    g_val.to_csv(os.path.join(splits_dir, g_val_file), index=False)
+                    g_test.to_csv(os.path.join(splits_dir, g_test_file), index=False)
+                    
+                    group_splits_catalog[group_value] = {
+                        "train": f"/shared/datasets/splits/{g_train_file}",
+                        "val": f"/shared/datasets/splits/{g_val_file}",
+                        "test": f"/shared/datasets/splits/{g_test_file}"
+                    }
+                except Exception as e:
+                    logger.warning(f"Failed to save group splits for {group_value}: {e}")
             
             train_df = pd.concat(train_dfs, ignore_index=True)
             val_df = pd.concat(val_dfs, ignore_index=True)
             test_df = pd.concat(test_dfs, ignore_index=True)
         else:
             # Simple temporal split for non-grouped data
-            train_size = int(len(df) * train_ratio)
-            val_size = int(len(df) * val_ratio)
-            
-            train_df = df[:train_size].copy()
-            val_df = df[train_size:train_size + val_size].copy()
-            test_df = df[train_size + val_size:].copy()
+            if training_cutoff_date:
+                try:
+                    cutoff = pd.to_datetime(training_cutoff_date).tz_localize(None)
+                    train_df = df[df[date_column] <= cutoff].copy()
+                    rem_df = df[df[date_column] > cutoff].copy()
+                    
+                    total_eval_ratio = val_ratio + test_ratio
+                    v_prop = val_ratio / total_eval_ratio if total_eval_ratio > 0 else 0.5
+                    v_size = int(len(rem_df) * v_prop)
+                    
+                    val_df = rem_df[:v_size].copy()
+                    test_df = rem_df[v_size:].copy()
+                    append_log(job_id, f"Using date-based split at {cutoff}")
+                except Exception as e:
+                    append_log(job_id, f"WARNING: Date-based split failed, falling back to ratio: {e}", "warning")
+                    train_size = int(len(df) * train_ratio)
+                    val_size = int(len(df) * val_ratio)
+                    train_df = df[:train_size].copy()
+                    val_df = df[train_size:train_size + val_size].copy()
+                    test_df = df[train_size + val_size:].copy()
+            else:
+                train_size = int(len(df) * train_ratio)
+                val_size = int(len(df) * val_ratio)
+                
+                train_df = df[:train_size].copy()
+                val_df = df[train_size:train_size + val_size].copy()
+                test_df = df[train_size + val_size:].copy()
         
         append_log(job_id, f"Data split: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
+        
+        # Save split datasets to shared storage
+        try:
+            splits_dir = os.path.join(os.getenv("DATASETS_PATH", "/shared/datasets"), "splits")
+            os.makedirs(splits_dir, exist_ok=True)
+            
+            train_split_path = os.path.join(splits_dir, f"{job_id}_train.csv")
+            val_split_path = os.path.join(splits_dir, f"{job_id}_val.csv")
+            test_split_path = os.path.join(splits_dir, f"{job_id}_test.csv")
+            
+            train_df.to_csv(train_split_path, index=False)
+            val_df.to_csv(val_split_path, index=False)
+            test_df.to_csv(test_split_path, index=False)
+            
+            data_splits = {
+                "train": f"/shared/datasets/splits/{job_id}_train.csv",
+                "val": f"/shared/datasets/splits/{job_id}_val.csv",
+                "test": f"/shared/datasets/splits/{job_id}_test.csv"
+            }
+            append_log(job_id, f"Saved data splits to: {splits_dir}")
+        except Exception as e:
+            append_log(job_id, f"WARNING: Failed to save data splits: {e}", "warning")
+            data_splits = None
         
         # Determine if we're training per-group models or a single model
         if group_column and group_column in df.columns:
@@ -305,6 +443,7 @@ def process_training_job(job_data: Dict[str, Any]):
                     # Train model with correct parameters for each model type
                     # NOTE: For grouped models, we DON'T pass group_column to trainers
                     # because we're already training on single-group data
+                    fit_start = time.time()
                     if model_lower in ['xgboost', 'lightgbm']:
                         # Tree models need validation set and feature columns
                         trainer.train(
@@ -323,6 +462,7 @@ def process_training_job(job_data: Dict[str, Any]):
                             date_column=date_column,
                             target_column=target_column,
                             feature_columns=feature_columns,
+                            frequency=frequency,
                             config=model_config
                         )
                     elif model_lower == 'arima':
@@ -333,19 +473,24 @@ def process_training_job(job_data: Dict[str, Any]):
                             arima_config['seasonal'] = True  # Enable SARIMAX
                             arima_config['m'] = 7  # Weekly seasonality for daily data
                         
-                        trainer.train(
+                        train_result = trainer.train(
                             train_df=group_train_df,
                             date_column=date_column,
                             target_column=target_column,
                             config=arima_config,
-                            feature_columns=feature_columns
+                            feature_columns=feature_columns,
+                            frequency=frequency,
+                            log_callback=lambda msg, level="info": append_log(job_id, f"  [ARIMA] {msg}", level)
                         )
+                        if 'auto_feature_columns' in train_result and train_result['auto_feature_columns']:
+                            append_log(job_id, f"  ARIMA activated automated features: {train_result['auto_feature_columns']}")
                     elif model_lower in ['naive', 'seasonal_naive']:
                         # Baseline models only need train_df and target
                         trainer.train(
                             train_df=group_train_df,
                             target_column=target_column,
-                            seasonal_period=model_config.get('seasonal_period', 7)
+                            seasonal_period=model_config.get('seasonal_period', 7),
+                            frequency=frequency
                         )
                     else:
                         # Fallback
@@ -355,6 +500,12 @@ def process_training_job(job_data: Dict[str, Any]):
                             date_column=date_column,
                             config=model_config
                         )
+                    fit_duration = time.time() - fit_start
+                    
+                    # Log specific ARIMA details if available
+                    if model_lower == 'arima' and hasattr(trainer, 'best_order'):
+                        append_log(job_id, f"  Selected ARIMA parameters for {full_model_name}: order={trainer.best_order}, seasonal={trainer.best_seasonal_order}")
+                    
                 
                     # Save model
                     # For XGBoost/LightGBM, save complete trainer state (model + metadata)
@@ -397,30 +548,55 @@ def process_training_job(job_data: Dict[str, Any]):
                         #
                         # Fix: forecast through (val + test), then score ONLY the last len(test) points.
                         val_len = len(group_val_df)
+                        # BRIDGE THE CONTEXT GAP: Use Val data as fresh history before predicting Test
+                        # ---------------------------------------------------------------------------
                         test_len = len(group_test_df)
-                        eval_horizon = val_len + test_len
-
+                        eval_horizon = test_len  # Now we only forecast the test portion
+                        
                         if test_len == 0:
                             raise ValueError("Test set is empty; cannot evaluate model")
 
-                        # Build a combined evaluation window (val + test) for exogenous/regressor inputs
-                        eval_df = pd.concat([group_val_df, group_test_df], ignore_index=True)
+                        # Build a combined evaluation window (test only for prediction target)
+                        eval_df = group_test_df.copy()
                         if date_column in eval_df.columns:
                             eval_df = eval_df.sort_values(date_column).reset_index(drop=True)
 
-                        # Build the expected future date index (what our forecasters assume)
-                        # This matters if the dataset has missing days or irregular spacing.
-                        last_date = pd.Timestamp(group_train_df[date_column].iloc[-1])
-                        future_dates = pd.date_range(
-                            start=last_date + pd.Timedelta(days=1),
-                            periods=eval_horizon,
-                            freq='D',
-                        )
+                        # Update trainer state with Validation context
+                        try:
+                            if model_lower == 'prophet' and hasattr(trainer, 'update'):
+                                trainer.update(group_val_df, date_column, target_column)
+                            elif model_lower == 'arima' and hasattr(trainer, 'update'):
+                                trainer.update(
+                                    group_val_df, 
+                                    target_column, 
+                                    feature_columns,
+                                    log_callback=lambda msg, level="info": append_log(job_id, f"  [ARIMA-Context] {msg}", level)
+                                )
+                            elif model_lower in ['naive', 'seasonal_naive'] and hasattr(trainer, 'update'):
+                                trainer.update(group_val_df, target_column)
+                            append_log(job_id, f"  Updated {model_lower} with {len(group_val_df)} validation rows as context")
+                        except Exception as update_err:
+                            append_log(job_id, f"  WARNING: Failed to update context for {model_lower}: {update_err}", "warning")
 
+                        # Define frequency offset for start date calculation
+                        try:
+                            offset = pd.tseries.frequencies.to_offset(frequency)
+                        except:
+                            offset = pd.Timedelta(days=1)
+                            append_log(job_id, f"WARNING: Failed to convert frequency '{frequency}' to offset, falling back to Daily offset.", "warning")
+
+                        # Start forecast from end of Validation set
+                        last_date = pd.Timestamp(group_val_df[date_column].iloc[-1])
+                        future_dates = pd.date_range(
+                            start=last_date + offset,
+                            periods=eval_horizon,
+                            freq=frequency,
+                        )
+                        
                         append_log(
                             job_id,
-                            f"Eval setup: val_len={val_len}, test_len={test_len}, eval_horizon={eval_horizon}, "
-                            f"train_end={str(last_date)}, future_start={str(future_dates[0])}, future_end={str(future_dates[-1])}",
+                            f"Eval setup: val_context_len={len(group_val_df)}, test_len={test_len}, "
+                            f"val_end={str(last_date)}, future_start={str(future_dates[0])}, future_end={str(future_dates[-1])}",
                         )
                         # Check how well eval_df covers the expected future date grid
                         try:
@@ -440,9 +616,8 @@ def process_training_job(job_data: Dict[str, Any]):
                             if feature_columns:
                                 # Align regressors to the expected future date index
                                 # IMPORTANT: ProphetTrainer.make_future_dataframe(include_history=True) requires
-                                # regressor values for history too. Provide (train history + future) to avoid
-                                # bfill/ffill washing out regressors.
-                                reg_source = pd.concat([group_train_df, eval_df], ignore_index=True)
+                                # regressor values for history too. Provide (train history + val + test)
+                                reg_source = pd.concat([group_train_df, group_val_df, group_test_df], ignore_index=True)
                                 reg = reg_source[[date_column] + feature_columns].copy()
                                 reg[date_column] = pd.to_datetime(reg[date_column])
                                 reg = reg.drop_duplicates(subset=[date_column], keep='last').set_index(date_column)
@@ -474,14 +649,15 @@ def process_training_job(job_data: Dict[str, Any]):
                             result = trainer.predict(
                                 horizon=eval_horizon, 
                                 last_date=last_date, 
-                                frequency='D',
-                                exog_future=exog_future
+                                frequency=frequency, # Use actual frequency, not hardcoded 'D'
+                                exog_future=exog_future,
+                                log_callback=lambda msg, level="info": append_log(job_id, f"  [ARIMA-Eval] {msg}", level)
                             )
                             predictions_all = np.array(result['predictions']) if isinstance(result, dict) else np.array(result)
                             pred_dates_all = pd.to_datetime(result.get('dates')) if isinstance(result, dict) and 'dates' in result else future_dates
                         elif model_lower in ['naive', 'seasonal_naive']:
                             # Naive: predict(horizon, last_date) -> {"predictions": [...], "dates": [...]}
-                            result = trainer.predict(horizon=eval_horizon, last_date=last_date, frequency='D')
+                            result = trainer.predict(horizon=eval_horizon, last_date=last_date, frequency=frequency)
                             predictions_all = np.array(result['predictions']) if isinstance(result, dict) else np.array(result)
                             pred_dates_all = pd.to_datetime(result.get('dates')) if isinstance(result, dict) and 'dates' in result else future_dates
                         elif model_lower in ['xgboost', 'lightgbm']:
@@ -591,6 +767,28 @@ def process_training_job(job_data: Dict[str, Any]):
                         mae = mean_absolute_error(actuals, predictions)
                         rmse = np.sqrt(mean_squared_error(actuals, predictions))
                         
+                        # Calculate correlation and std ratio for deep diagnostics
+                        correlation = 0.0
+                        std_ratio = 1.0
+                        if len(actuals) > 1:
+                            if np.std(actuals) > 0 and np.std(predictions) > 0:
+                                correlation = np.corrcoef(actuals, predictions)[0, 1]
+                                std_ratio = np.std(predictions) / np.std(actuals)
+
+                        append_log(job_id, f"  Deep Diagnostics for {full_model_name}:")
+                        append_log(job_id, f"    Correlation (Pearson): {correlation:.4f}")
+                        append_log(job_id, f"    Std Ratio (Pred/Actual): {std_ratio:.4f}")
+                        
+                        # Log sample rows for exact alignment verification
+                        try:
+                            sample_size = min(10, len(aligned))
+                            sample_df = aligned.head(sample_size).copy()
+                            sample_df['error'] = sample_df['actual'] - sample_df['pred']
+                            sample_str = sample_df.to_string()
+                            append_log(job_id, f"    First {sample_size} test rows (alignment check):\n{sample_str}")
+                        except Exception as e:
+                            append_log(job_id, f"    WARNING: Could not log alignment sample: {e}", "warning")
+
                         # MAPE with zero-division protection
                         non_zero_mask = actuals != 0
                         if np.sum(non_zero_mask) > 0:
@@ -658,10 +856,12 @@ def process_training_job(job_data: Dict[str, Any]):
                         "modelType": full_model_name,
                         "model_path": model_path,
                         "metrics": metrics,
-                        "group_value": str(group_value) if group_value is not None else None,
+                        "training_time": fit_duration,
+                        "groupValue": str(group_value) if group_value is not None else None,
                         "train_size": len(group_train_df),
                         "val_size": len(group_val_df),
                         "test_size": len(group_test_df),
+                        "dataSplits": group_splits_catalog.get(group_value) if group_value is not None else data_splits,
                     }
                     
                     append_log(job_id, f"{full_model_name} trained successfully. Model saved to: {model_path}")
@@ -678,7 +878,10 @@ def process_training_job(job_data: Dict[str, Any]):
         redis_client.set(result_key, json.dumps(results_array), ex=3600)  # Expire after 1 hour
         
         append_log(job_id, "Training completed successfully!")
-        publish_progress(job_id, "completed", "Training completed", 100, {"results": results_array})
+        publish_progress(job_id, "completed", "Training completed", 100, {
+            "results": results_array,
+            "dataSplits": data_splits
+        })
         
     except Exception as e:
         error_msg = f"Training failed: {str(e)}"

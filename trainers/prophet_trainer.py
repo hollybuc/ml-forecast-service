@@ -27,6 +27,7 @@ class ProphetTrainer:
         target_column: str,
         feature_columns: Optional[list[str]] = None,
         config: Optional[Dict[str, Any]] = None,
+        frequency: str = 'D',
         **kwargs,
     ) -> Dict[str, Any]:
         """Train Prophet model.
@@ -174,14 +175,16 @@ class ProphetTrainer:
         self,
         horizon: int,
         future_regressors: Optional[pd.DataFrame] = None,
-        include_history: bool = False,
+        frequency: str = 'D',
+        include_history: bool = False
     ) -> Dict[str, Any]:
         """Generate forecast.
 
         Args:
             horizon: Number of steps to forecast.
             future_regressors: DataFrame with future regressor values.
-            include_history: Whether to include historical predictions.
+            frequency: Frequency of the future dataframe (e.g., 'D' for daily, 'H' for hourly).
+            include_history: Whether to include historical predictions in output.
 
         Returns:
             Dictionary with predictions.
@@ -191,12 +194,8 @@ class ProphetTrainer:
         if self.model is None:
             raise ValueError("Model not trained yet")
 
-        # Create future dataframe
-        # IMPORTANT: Always include history so Prophet has regressor values for historical data
-        future = self.model.make_future_dataframe(
-            periods=horizon,
-            include_history=True,  # Always include history to avoid NaN in regressors
-        )
+        # Generate future dataframe
+        future = self.model.make_future_dataframe(periods=horizon, freq=frequency)
 
         # Add future regressors if provided
         if future_regressors is not None and not future_regressors.empty:
@@ -233,7 +232,7 @@ class ProphetTrainer:
         try:
             forecast = self.model.predict(future)
 
-            # Extract forecast values (only future, not history)
+            # Extract forecast values
             if not include_history:
                 forecast = forecast.tail(horizon)
 
@@ -250,6 +249,47 @@ class ProphetTrainer:
         except Exception as e:
             logger.error(f"Prophet prediction failed: {str(e)}")
             raise
+
+    def update(
+        self,
+        df: pd.DataFrame,
+        date_column: str,
+        target_column: str,
+    ):
+        """Update model by re-fitting on expanded data.
+        
+        Args:
+            df: Combined historical data (e.g. Train + Val).
+            date_column: Date column name.
+            target_column: Target column name.
+        """
+        if self.model is None:
+            raise ValueError("Model not trained yet")
+
+        # Prophet needs a fresh fit to update its history and trend baseline
+        logger.info(f"Updating Prophet model with {len(df)} total observations")
+        
+        prophet_df = pd.DataFrame(
+            {
+                "ds": df[date_column],
+                "y": df[target_column],
+            }
+        )
+        prophet_df["ds"] = pd.to_datetime(prophet_df["ds"])
+        prophet_df = prophet_df.sort_values("ds").reset_index(drop=True)
+
+        # Re-add regressors if they exist in df
+        regressors = [col for col in self.model.extra_regressors.keys()]
+        for reg in regressors:
+            if reg in df.columns:
+                prophet_df[reg] = df[reg]
+
+        try:
+            # We must re-fit to update the model state
+            self.model.fit(prophet_df)
+            logger.info("Prophet model update (re-fit) successful")
+        except Exception as e:
+            logger.error(f"Failed to update Prophet model: {e}")
 
     def save(self, path: str):
         """Save model to file.

@@ -22,6 +22,8 @@ class LGBMTrainer:
         self.config = None
         self.feature_names = None
         self.time_interval = pd.Timedelta(days=1)
+        self.target_differencing = True  # High-impact fix for level-shift issues
+        self.last_train_value = 0.0
 
     def train(
         self,
@@ -80,8 +82,24 @@ class LGBMTrainer:
         # Prepare X, y
         X_train, y_train = self._prepare_xy(train_features, target_column)
 
+        # Apply target differencing if enabled
+        # We predict y[t] - y[t-1] (delta)
+        # Note: lag_1 column in features already stores y[t-1]
+        self.target_differencing = config.get("target_differencing", True)
+        self.last_train_value = train_df[target_column].iloc[-1]
+
+        if self.target_differencing:
+            if f"lag_1" in X_train.columns:
+                y_train = y_train - X_train["lag_1"]
+                logger.info("Using target differencing (predicting deltas)")
+            else:
+                logger.warning("Target differencing enabled but 'lag_1' missing. Disabling.")
+                self.target_differencing = False
+
         if val_features is not None:
             X_val, y_val = self._prepare_xy(val_features, target_column)
+            if self.target_differencing:
+                y_val = y_val - X_val["lag_1"]
         else:
             X_val, y_val = None, None
 
@@ -356,9 +374,17 @@ class LGBMTrainer:
                 logger.error(f"Missing features for prediction: {missing}")
                 raise ValueError(f"Missing features: {missing}")
 
-            # Predict
-            pred = self.model.predict(X_last)[0]
-            predictions.append(pred)
+            # Predict (model predicts delta if target_differencing is True)
+            pred_val = self.model.predict(X_last)[0]
+
+            # Re-integrate if differencing was used
+            if self.target_differencing:
+                last_val = current_df[target_column].iloc[-1]
+                final_pred = last_val + pred_val
+            else:
+                final_pred = pred_val
+
+            predictions.append(final_pred)
 
             # Append prediction to dataframe for next iteration
             last_date = current_df[date_column].iloc[-1]
@@ -368,7 +394,7 @@ class LGBMTrainer:
 
             new_row = current_df.iloc[[-1]].copy()
             new_row[date_column] = next_date
-            new_row[target_column] = pred  # Use prediction for lag features
+            new_row[target_column] = final_pred  # Use prediction for lag features
             
             # IMPROVED: Use actual historical values from same period last year
             # This preserves realistic variation in exogenous features

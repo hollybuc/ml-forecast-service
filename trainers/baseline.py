@@ -83,7 +83,7 @@ class NaiveTrainer:
         dates = None
         if last_date is not None:
             dates = pd.date_range(
-                start=last_date + pd.Timedelta(days=1),
+                start=pd.Timestamp(last_date) + pd.tseries.frequencies.to_offset(frequency),
                 periods=horizon,
                 freq=frequency,
             )
@@ -92,6 +92,21 @@ class NaiveTrainer:
             "predictions": predictions.tolist(),
             "dates": dates.tolist() if dates is not None else None,
         }
+
+    def update(
+        self,
+        df: pd.DataFrame,
+        target_column: str,
+    ):
+        """Update last value with new observations.
+        
+        Args:
+            df: New data to append.
+            target_column: Target column name.
+        """
+        if len(df) > 0:
+            self.last_value = df[target_column].iloc[-1]
+            logger.info(f"Naive model updated with last value: {self.last_value:.2f}")
 
     def save(self, path: str):
         """Save model to file.
@@ -209,7 +224,7 @@ class SeasonalNaiveTrainer:
         dates = None
         if last_date is not None:
             dates = pd.date_range(
-                start=last_date + pd.Timedelta(days=1),
+                start=pd.Timestamp(last_date) + pd.tseries.frequencies.to_offset(frequency),
                 periods=horizon,
                 freq=frequency,
             )
@@ -218,6 +233,26 @@ class SeasonalNaiveTrainer:
             "predictions": predictions.tolist(),
             "dates": dates.tolist() if dates is not None else None,
         }
+    def update(
+        self,
+        df: pd.DataFrame,
+        target_column: str,
+    ):
+        """Update seasonal values with new observations.
+        
+        Args:
+            df: New data to append.
+            target_column: Target column name.
+        """
+        if len(df) >= self.seasonal_period:
+            self.seasonal_values = df[target_column].iloc[-self.seasonal_period:].values
+            logger.info(f"Seasonal Naive model updated with {len(df)} new observations")
+        elif len(df) > 0:
+            # Shift old seasonal values and append new ones
+            new_vals = df[target_column].values
+            combined = np.concatenate([self.seasonal_values, new_vals])
+            self.seasonal_values = combined[-self.seasonal_period:]
+            logger.info(f"Seasonal Naive model partially updated with {len(df)} new observations")
 
     def save(self, path: str):
         """Save model to file.

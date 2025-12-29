@@ -6,6 +6,7 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import timedelta
+from services.feature_engineering import add_automated_temporal_features
 import logging
 
 logger = logging.getLogger(__name__)
@@ -364,20 +365,93 @@ class ForecastService:
             
             # Check if model needs exogenous variables
             exog_future = None
-            if hasattr(model_fit, 'model') and hasattr(model_fit.model, 'exog') and model_fit.model.exog is not None:
+            
+            # DEBUG LOGGING: Show what's in the model dict
+            if isinstance(model, dict):
+                logger.info(f"Model dict keys: {list(model.keys())}")
+            
+            # Try to get model metadata to understand which features were used
+            # ARIMA trainer saves feature_columns and auto_feature_columns at TOP LEVEL of dict
+            if isinstance(model, dict):
+                feature_columns = model.get('feature_columns', [])
+                auto_feature_columns = model.get('auto_feature_columns', [])
+                scaler = model.get('scaler', None)
+                logger.info(f"Extracted from model dict: feature_columns={feature_columns}, auto_feature_columns={auto_feature_columns}, scaler={'present' if scaler else 'None'}")
+            else:
+                feature_columns = getattr(model_fit, 'feature_columns', [])
+                auto_feature_columns = getattr(model_fit, 'auto_feature_columns', [])
+                scaler = getattr(model_fit, 'scaler', None)
+                logger.info(f"Extracted from model_fit: feature_columns={feature_columns}, auto_feature_columns={auto_feature_columns}, scaler={'present' if scaler else 'None'}")
+            
+            # Check if model was trained with exog
+            model_has_exog = False
+            if hasattr(model_fit, 'model') and hasattr(model_fit.model, 'exog'):
+                model_has_exog = model_fit.model.exog is not None
+            elif hasattr(model_fit, 'exog_'):
+                model_has_exog = model_fit.exog_ is not None
+            
+            logger.info(f"Model has exog check: {model_has_exog}")
+            
+            if model_has_exog:
                 logger.info("ARIMA model was trained with exogenous variables, preparing future exog")
-                # Get the number of exog features
-                n_exog = model_fit.model.exog.shape[1] if len(model_fit.model.exog.shape) > 1 else 1
-                logger.info(f"ARIMA needs {n_exog} exogenous variables")
+                logger.info(f"Feature columns from training: {feature_columns}")
+                logger.info(f"Auto feature columns: {auto_feature_columns}")
                 
-                if df is not None and len(df.columns) > 2:  # More than date and target
-                    # Use last known values for exogenous variables
-                    exog_cols = [col for col in df.columns if col not in ['date', df.columns[0]] and pd.api.types.is_numeric_dtype(df[col])]
-                    if len(exog_cols) >= n_exog:
-                        last_exog_values = df[exog_cols[:n_exog]].iloc[-1].values
-                        # Repeat for horizon
-                        exog_future = np.tile(last_exog_values, (horizon, 1))
-                        logger.info(f"Using exog values: {last_exog_values}")
+                if df is not None:
+                    # Generate future dates for the forecast horizon
+                    date_col = df.columns[0]  # Assume first column is date
+                    last_date = pd.to_datetime(df[date_col].max())
+                    
+                    # Infer frequency from data
+                    date_series = pd.to_datetime(df[date_col])
+                    freq_mode = date_series.diff().mode()
+                    if not freq_mode.empty:
+                        freq_delta = freq_mode[0]
+                    else:
+                        freq_delta = pd.Timedelta(days=1)
+                    
+                    # Generate future dates
+                    future_dates = pd.date_range(
+                        start=last_date + freq_delta,
+                        periods=horizon,
+                        freq=freq_delta
+                    )
+                    
+                    # Create future dataframe
+                    future_df = pd.DataFrame({date_col: future_dates})
+                    
+                    # Generate automated temporal features (Fourier, DOFW, Month)
+                    if auto_feature_columns:
+                        logger.info(f"Generating {len(auto_feature_columns)} automated temporal features")
+                        future_df, _ = add_automated_temporal_features(future_df, date_col)
+                    
+                    # Forward-fill user-provided features from last known values
+                    user_features = [f for f in feature_columns if f not in auto_feature_columns]
+                    if user_features:
+                        logger.info(f"Forward-filling {len(user_features)} user features: {user_features}")
+                        for feat in user_features:
+                            if feat in df.columns:
+                                last_value = df[feat].iloc[-1]
+                                future_df[feat] = last_value
+                            else:
+                                logger.warning(f"Feature '{feat}' not found in data, filling with 0")
+                                future_df[feat] = 0
+                    
+                    # Combine all exog columns in the correct order
+                    all_exog_cols = user_features + auto_feature_columns
+                    exog_future_df = future_df[all_exog_cols]
+                    
+                    # Apply scaler if it was saved
+                    if scaler is not None:
+                        logger.info("Applying saved StandardScaler to future exog")
+                        exog_future = scaler.transform(exog_future_df)
+                    else:
+                        exog_future = exog_future_df.values
+                    
+                    logger.info(f"Generated future exog shape: {exog_future.shape}")
+                else:
+                    logger.error("Model requires exog but no historical data provided")
+                    raise ValueError("ARIMA model requires exogenous variables but no data was provided")
             
             if 'pmdarima' in model_type_str or 'arima.ARIMA' in model_type_str:
                 # pmdarima ARIMA model
@@ -385,7 +459,7 @@ class ForecastService:
                 try:
                     predictions, conf_int = model_fit.predict(
                         n_periods=horizon, 
-                        exogenous=exog_future,
+                        X=exog_future,
                         return_conf_int=True, 
                         alpha=0.05
                     )
@@ -394,7 +468,7 @@ class ForecastService:
                     upper_95 = conf_int[:, 1]
                 except Exception as e:
                     logger.warning(f"Confidence interval extraction failed: {e}, using predictions only")
-                    predictions = model_fit.predict(n_periods=horizon, exogenous=exog_future)
+                    predictions = model_fit.predict(n_periods=horizon, X=exog_future)
                     predictions = np.array(predictions)
                     # Fallback CI
                     std_err = np.std(predictions) if len(predictions) > 1 else abs(predictions[0]) * 0.1

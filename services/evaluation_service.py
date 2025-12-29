@@ -39,6 +39,8 @@ class EvaluationService:
                 model_path = training_result.get('modelPath')
                 training_time = training_result.get('trainingTime', 0)
                 metrics = training_result.get('metrics')
+                training_result_id = training_result.get('id')
+                metadata = training_result.get('metadata', {})
 
                 logger.info(f"Processing model: {model_type} with metrics: {metrics}")
 
@@ -66,6 +68,8 @@ class EvaluationService:
                     },
                     'trainingTime': float(training_time),
                     'predictionTime': 0,  # Not re-predicting, using stored metrics
+                    'trainingResultId': training_result_id,
+                    'metadata': metadata,
                 })
 
             except Exception as e:
@@ -75,6 +79,64 @@ class EvaluationService:
 
         if not model_results:
             raise ValueError("No models could be evaluated. Please ensure models are trained successfully with valid metrics.")
+
+        # Check if we have grouped models (models with group_value in metadata)
+        has_grouped_models = any(
+            result.get('metadata', {}).get('group_value') is not None 
+            for result in model_results
+        )
+
+        if has_grouped_models:
+            logger.info("Detected grouped models, aggregating by base model type")
+            # Group models by base model type
+            grouped_by_model = {}
+            for result in model_results:
+                base_model = result['modelName'].split('_')[0]  # Extract base model (e.g., "arima" from "arima_North")
+                group_value = result.get('metadata', {}).get('group_value')
+                
+                if base_model not in grouped_by_model:
+                    grouped_by_model[base_model] = {
+                        'modelName': base_model,
+                        'groupedResults': [],
+                        'metadata': result.get('metadata', {}),
+                        'trainingResultId': result.get('trainingResultId'),
+                    }
+                
+                # Add this result to the grouped results
+                grouped_by_model[base_model]['groupedResults'].append({
+                    'group_value': group_value,
+                    'metrics': result['metrics'],
+                    'trainingTime': result.get('trainingTime', 0),
+                    'metadata': result.get('metadata', {}),
+                })
+            
+            # Calculate averaged metrics for each model type
+            aggregated_results = []
+            for base_model, group_data in grouped_by_model.items():
+                # Calculate average metrics across all groups
+                avg_metrics = {}
+                for metric_name in ['mae', 'rmse', 'mape', 'smape', 'r2', 'medae', 'mase']:
+                    values = [
+                        gr['metrics'].get(metric_name, 0)
+                        for gr in group_data['groupedResults']
+                        if gr['metrics'].get(metric_name) is not None
+                    ]
+                    avg_metrics[metric_name] = float(sum(values) / len(values)) if values else 0.0
+                
+                aggregated_results.append({
+                    'modelName': base_model,
+                    'metrics': avg_metrics,
+                    'trainingTime': sum(gr.get('trainingTime', 0) for gr in group_data['groupedResults']),
+                    'predictionTime': 0,
+                    'trainingResultId': group_data['trainingResultId'],
+                    'metadata': {
+                        **group_data['metadata'],
+                        'groupedResults': group_data['groupedResults'],
+                    }
+                })
+            
+            model_results = aggregated_results
+            logger.info(f"Aggregated {len(model_results)} model types from grouped results")
 
         # Sort models by ranking metric
         reverse_sort = ranking_metric == 'r2'  # Higher is better for R2
@@ -88,6 +150,18 @@ class EvaluationService:
             result['rank'] = idx + 1
 
         # Calculate summary statistics
+        # If we have grouped models, total models should count individuals
+        total_models_count = 0
+        total_training_time = 0.0
+        for r in model_results:
+            if 'groupedResults' in r.get('metadata', {}):
+                count = len(r['metadata']['groupedResults'])
+                total_models_count += count
+                total_training_time += r.get('trainingTime', 0)
+            else:
+                total_models_count += 1
+                total_training_time += r.get('trainingTime', 0)
+
         best_model = model_results[0]['modelName'] if model_results else None
         best_model_metrics = model_results[0]['metrics'] if model_results else {}
 
@@ -103,23 +177,38 @@ class EvaluationService:
         recommendations = self._generate_recommendations(model_results, ranking_metric, best_model)
 
         summary = {
-            'totalModels': len(model_results),
+            'totalModels': total_models_count,
             'bestModelMetrics': best_model_metrics,
             'averageMetrics': avg_metrics,
             'recommendations': recommendations,
+            'totalTrainingTime': total_training_time,
         }
 
         logger.info(f"Evaluation complete. Best model: {best_model} with {ranking_metric}={best_model_metrics.get(ranking_metric, 0):.4f}")
+
+        # Prepare top-level metadata
+        report_metadata = {
+            'processingTime': 0,  # Will be set by worker
+            'totalModelsEvaluated': len(model_results),
+        }
+
+        # Promote common metadata from the first model result if it exists
+        if model_results:
+            # Check for dataSplits in the models metadata
+            # EvaluationService.evaluate_models takes training_results which contains metadata
+            # We already extracted metadata and put it into model_results[i]['metadata'] 
+            # in evaluate_models loop
+            first_metadata = model_results[0].get('metadata', {})
+            for key in ['dataSplits', 'trainSize', 'valSize', 'testSize']:
+                if key in first_metadata:
+                    report_metadata[key] = first_metadata[key]
 
         return {
             'rankingMetric': ranking_metric,
             'bestModel': best_model,
             'modelResults': model_results,
             'summary': summary,
-            'metadata': {
-                'processingTime': 0,  # Will be set by worker
-                'totalModelsEvaluated': len(model_results),
-            }
+            'metadata': report_metadata
         }
 
     def _generate_recommendations(
