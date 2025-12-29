@@ -204,6 +204,20 @@ class ProphetTrainer:
                 future_regressors = future_regressors.copy()
                 future_regressors['ds'] = pd.to_datetime(future_regressors['ds'])
                 
+                # Handle NaN values in future regressors BEFORE mapping
+                regressor_cols = [col for col in future_regressors.columns if col != 'ds']
+                for col in regressor_cols:
+                    if future_regressors[col].isna().any():
+                        logger.warning(f"Future regressor '{col}' contains NaN values. Filling with forward/backward fill.")
+                        future_regressors[col] = future_regressors[col].ffill().bfill()
+                        # If still NaN, fill with mean
+                        if future_regressors[col].isna().any():
+                            mean_val = future_regressors[col].mean()
+                            if pd.isna(mean_val):
+                                mean_val = 0.0
+                            logger.warning(f"Future regressor '{col}' still has NaN. Filling with {mean_val}")
+                            future_regressors[col] = future_regressors[col].fillna(mean_val)
+                
                 # Merge future regressors by date
                 # This will add regressor columns to the future dataframe
                 for col in future_regressors.columns:
@@ -282,7 +296,19 @@ class ProphetTrainer:
         regressors = [col for col in self.model.extra_regressors.keys()]
         for reg in regressors:
             if reg in df.columns:
-                prophet_df[reg] = df[reg]
+                # Handle NaN values in regressors - Prophet cannot handle NaN
+                if df[reg].isna().any():
+                    logger.warning(f"Regressor '{reg}' contains NaN values. Filling with forward/backward fill.")
+                    prophet_df[reg] = df[reg].ffill().bfill()
+                    # If still NaN after ffill/bfill, fill with mean
+                    if prophet_df[reg].isna().any():
+                        mean_val = prophet_df[reg].mean()
+                        if pd.isna(mean_val):
+                            mean_val = 0.0
+                        logger.warning(f"Regressor '{reg}' still has NaN after ffill/bfill. Filling with {mean_val}")
+                        prophet_df[reg] = prophet_df[reg].fillna(mean_val)
+                else:
+                    prophet_df[reg] = df[reg]
 
         try:
             # We must re-fit to update the model state
@@ -290,6 +316,9 @@ class ProphetTrainer:
             logger.info("Prophet model update (re-fit) successful")
         except Exception as e:
             logger.error(f"Failed to update Prophet model: {e}")
+            logger.warning("Continuing with original model state (no update applied)")
+            # Don't raise - continue with the original model state
+            # This allows prediction to proceed even if update fails
 
     def save(self, path: str):
         """Save model to file.

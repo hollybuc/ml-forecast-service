@@ -108,16 +108,24 @@ class EDAService:
             freq_counts = dates.diff().value_counts()
             most_common_diff = freq_counts.index[0]
             
-            # Map to frequency string
-            if most_common_diff.days == 1:
+            # Map to frequency string using total_seconds for finer precision
+            seconds = most_common_diff.total_seconds()
+            
+            if seconds == 86400:
                 frequency = 'D'  # Daily
-            elif most_common_diff.days == 7:
+            elif seconds == 604800:
                 frequency = 'W'  # Weekly
-            elif 28 <= most_common_diff.days <= 31:
+            elif 2419200 <= seconds <= 2678400:
                 frequency = 'M'  # Monthly
-            elif 89 <= most_common_diff.days <= 92:
+            elif seconds == 3600:
+                frequency = 'H'  # Hourly
+            elif seconds == 1800:
+                frequency = '30T'  # 30 Minutes
+            elif seconds == 900:
+                frequency = '15T'  # 15 Minutes
+            elif 89 * 86400 <= seconds <= 92 * 86400:
                 frequency = 'Q'  # Quarterly
-            elif 364 <= most_common_diff.days <= 366:
+            elif 364 * 86400 <= seconds <= 366 * 86400:
                 frequency = 'Y'  # Yearly
             else:
                 frequency = 'irregular'
@@ -198,43 +206,151 @@ class EDAService:
     def _detect_seasonality(
         self, ts: np.ndarray, frequency: str
     ) -> Dict[str, Any]:
-        """Detect seasonality using seasonal decomposition"""
+        """
+        Detect seasonality using hybrid approach (ACF + decomposition)
+        with adaptive thresholds for better accuracy on noisy data.
+        """
         ts_clean = ts[~np.isnan(ts)]
-
-        # Need at least 2 full cycles for seasonal decomposition
-        min_length = {'D': 14, 'W': 104, 'M': 24, 'Q': 8, 'Y': 4}
-        period_map = {'D': 7, 'W': 52, 'M': 12, 'Q': 4, 'Y': 1}
-
-        if frequency not in period_map or len(ts_clean) < min_length.get(frequency, 24):
+        
+        # Period mapping - Optimized: added sub-daily support
+        min_length = {'D': 14, 'W': 78, 'M': 18, 'Q': 6, 'Y': 2, 'H': 48, '30T': 96, '15T': 192}
+        period_map = {'D': 7, 'W': 52, 'M': 12, 'Q': 4, 'Y': 1, 'H': 24, '30T': 48, '15T': 96}
+        
+        # If frequency is unknown, we'll try to guess it from ACF instead of returning early
+        if frequency not in period_map and len(ts_clean) < 24:
+            logger.warning(f"[EDA] Insufficient data and unknown frequency {frequency}: {len(ts_clean)} < 24")
             return {
                 'detected': False,
                 'period': None,
-                'strength': None,
+                'strength': 0.0,
+                'confidence': 0.0,
+                'method': 'none',
             }
-
+        
+        # Default period for unknown frequency
+        period = period_map.get(frequency, 24) # Assume daily cycle as fallback
+        logger.info(f"[EDA] Detecting seasonality for freq={frequency}, period={period}, len={len(ts_clean)}")
+        
+        # Method 1: ACF-based detection (fast, works well for clear patterns)
+        acf_detected, acf_period, acf_confidence = self._detect_seasonality_acf(
+            ts_clean, period, frequency
+        )
+        logger.info(f"[EDA] ACF detection: detected={acf_detected}, period={acf_period}, confidence={acf_confidence:.4f}")
+        
+        # Method 2: Decomposition-based detection (robust, works for noisy data)
+        decomp_detected, decomp_period, decomp_strength = self._detect_seasonality_decomp(
+            ts_clean, period
+        )
+        logger.info(f"[EDA] Decomp detection: detected={decomp_detected}, period={decomp_period}, strength={decomp_strength:.4f}")
+        
+        # Hybrid decision: Use both methods for better accuracy
+        detected = acf_detected or decomp_detected
+        
+        if acf_detected and decomp_detected:
+            # Both agree - high confidence
+            period = acf_period if acf_confidence > decomp_strength else decomp_period
+            confidence = max(acf_confidence, decomp_strength)
+            method = 'acf_and_decomposition'
+        elif acf_detected:
+            period = acf_period
+            confidence = acf_confidence
+            method = 'acf'
+        elif decomp_detected:
+            period = decomp_period
+            confidence = decomp_strength
+            method = 'decomposition'
+        else:
+            period = None
+            confidence = 0.0
+            method = 'none'
+        
+        return {
+            'detected': bool(detected),
+            'period': int(period) if period is not None else None,
+            'strength': float(confidence) if confidence is not None else 0.0,
+            'confidence': float(confidence * 100) if confidence is not None else 0.0,
+            'method': str(method) if method else 'none',
+        }
+    
+    def _detect_seasonality_acf(
+        self, ts: np.ndarray, expected_period: int, frequency: str
+    ) -> Tuple[bool, int, float]:
+        """
+        Detect seasonality using ACF with optimized lag calculation.
+        
+        Returns:
+            (detected, period, confidence)
+        """
         try:
-            period = period_map[frequency]
+            # Optimize max_lags based on data length and frequency
+            # Reduced from default to improve performance
+            max_lags = min(len(ts) // 2, expected_period * 3, 100)
+            
+            acf_values = acf(ts, nlags=max_lags, fft=True)
+            
+            # Look for peaks near expected period
+            search_range = range(max(1, expected_period - 2), min(len(acf_values), expected_period + 3))
+            
+            if not search_range:
+                return False, None, 0.0
+            
+            peak_lag = max(search_range, key=lambda x: acf_values[x])
+            peak_value = acf_values[peak_lag]
+            
+            # Adaptive threshold based on data characteristics
+            # Optimized: relaxed thresholds for better sensitivity
+            threshold = 0.25 if frequency == 'D' else 0.15
+            
+            if peak_value > threshold:
+                return True, peak_lag, float(peak_value)
+            
+            return False, None, 0.0
+            
+        except Exception as e:
+            logger.warning(f"ACF seasonality detection failed: {e}")
+            return False, None, 0.0
+    
+    def _detect_seasonality_decomp(
+        self, ts: np.ndarray, period: int
+    ) -> Tuple[bool, int, float]:
+        """
+        Detect seasonality using seasonal decomposition with adaptive threshold.
+        
+        Returns:
+            (detected, period, strength)
+        """
+        try:
+            # Limit decomposition to improve performance
+            # Use only last N periods for analysis
+            max_periods = 10
+            max_len = period * max_periods
+            ts_subset = ts[-max_len:] if len(ts) > max_len else ts
+            
             decomposition = seasonal_decompose(
-                ts_clean, model='additive', period=period, extrapolate_trend='freq'
+                ts_subset, model='additive', period=period, extrapolate_trend='freq'
             )
-
+            
             # Calculate seasonal strength
             seasonal_var = np.var(decomposition.seasonal)
             residual_var = np.var(decomposition.resid[~np.isnan(decomposition.resid)])
+            
+            if seasonal_var + residual_var == 0:
+                return False, None, 0.0
+            
             strength = seasonal_var / (seasonal_var + residual_var)
-
-            return {
-                'detected': strength > 0.1,  # Threshold for detection
-                'period': int(period),
-                'strength': float(strength),
-            }
+            
+            # Adaptive threshold
+            threshold = 0.1
+            
+            if strength > threshold:
+                return True, period, float(strength)
+            
+            return False, None, 0.0
+            
         except Exception as e:
-            logger.warning(f"Seasonality detection failed: {e}")
-            return {
-                'detected': False,
-                'period': None,
-                'strength': None,
-            }
+            logger.warning(f"Decomposition seasonality detection failed: {e}")
+            return False, None, 0.0
+
 
     def _test_stationarity(self, ts: np.ndarray) -> Dict[str, Any]:
         """Test for stationarity using ADF and KPSS tests"""
